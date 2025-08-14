@@ -12,6 +12,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, Auto
 from safetensors.torch import load_file
 import os
 from datasets import load_dataset
+from torch.utils.data import DataLoader, IterableDataset
 import pandas as pd
 import io
 import re
@@ -19,6 +20,9 @@ import random
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import argparse
 from tqdm import tqdm
+import time
+
+
 
 eval_prompt_template = '''Please help me judge the correctness of the generated answer and the corresponding rationale. 
 Question: {}
@@ -130,7 +134,17 @@ class VisionLanguageModel:
         text = self.processor.apply_chat_template(
             message, tokenize=False, add_generation_prompt=True
         )[:-32]
-        image_inputs = Image.open(io.BytesIO(image_feat))
+        if isinstance(image_feat, torch.Tensor):
+            # Convert tensor [C, H, W] to [H, W, C] and to uint8
+            arr = image_feat.cpu().numpy()
+            if arr.shape[0] == 3:  # [C, H, W]
+                arr = np.transpose(arr, (1, 2, 0))
+            arr = arr.astype(np.uint8)
+            image_inputs = Image.fromarray(arr)
+        elif isinstance(image_feat, bytes):
+            image_inputs = Image.open(io.BytesIO(image_feat)).convert('RGB')
+        else:
+            raise ValueError(f"Unsupported image_feat type: {type(image_feat)}")
         inputs = self.processor(
             text=[text],
             images=image_inputs,
@@ -353,44 +367,153 @@ def main(args):
     eval_llm_tokenizer = AutoTokenizer.from_pretrained(args.eval_model_name)
     final_response = []
 
-    df = pd.read_parquet(args.data_pths, engine='pyarrow')  # Your path of dataset
-    datas = df.to_dict(orient='records')
+    #df = pd.read_parquet(args.data_pths, engine='pyarrow')  # Your path of dataset
+    #df = load_dataset("russwang/ThinkLite-VL-70k")
+    #datas = df.to_dict(orient='records')
+    #datas = df["train"].to_pandas().to_dict(orient='records')
 
-    data_chunk = get_chunk(datas, args.num_chunks, args.chunk_idx)
-    for data in tqdm(data_chunk, desc="MCTS Progress"):
-        image_data = data['image']
-        question = data['problem'].split('<image>')[1]
-        answer = data['answer']
-        text_prompt = few_shot_cot_prompt + '{}'.format(question)
+    # Load the dataset
+    hf_dataset = load_dataset("russwang/ThinkLite-VL-70k")["train"]
+    print(f"Original dataset size: {len(hf_dataset)}")
 
-        root, solution_steps, solution, n_iter = solve_math_reasoning_vlm(
-            image_data=image_data,
-            text_prompt=text_prompt,
-            model=model,
-            generation_config=generation_config,
-            processor=processor,
-            eval_llm=eval_llm,
-            eval_llm_tokenizer=eval_llm_tokenizer,
-            question=question,
-            answer=answer,
-            n_iterations=args.max_num_iterations,
-        )
+    # Print a few samples to see the structure
+    # print("Sample data structure:")
+    # for i in range(min(3, len(hf_dataset))):
+    #     print(f"Sample {i}: {hf_dataset[i]}")
 
-        if solution is not None:
+    # Filter out None entries
+    def not_none(example):
+        required_fields = ["image", "problem", "answer", "id"]
+        return all(example.get(field) is not None for field in required_fields)
+
+
+    hf_dataset = hf_dataset.filter(not_none)
+    print(f"Filtered dataset size: {len(hf_dataset)}")
+    #hf_dataset = hf_dataset.select(range(20))  # Only use the first 20 samples
+
+    # Remove columns that are not needed and may contain None
+    hf_dataset = hf_dataset.remove_columns(["choices"])
+
+    # Decode images and convert to tensors
+    
+
+    def decode_image(example):
+        img = example['image']
+        # If it's bytes, decode to PIL
+        if isinstance(img, bytes):
+            img = Image.open(io.BytesIO(img)).convert('RGB')
+        # If it's a PIL image, resize
+        if isinstance(img, Image.Image):
+            img = img.resize((224, 224))
+            arr = np.array(img)
+            arr = np.transpose(arr, (2, 0, 1))  # [C, H, W]
+            img = torch.tensor(arr)
+        # If it's a numpy array, convert to tensor
+        elif isinstance(img, np.ndarray):
+            if img.shape != (3, 224, 224):
+                img = np.transpose(img, (2, 0, 1))
+            img = torch.tensor(img)
+        # If it's already a tensor, do nothing
+        example['image'] = img
+        return example
+
+    hf_dataset = hf_dataset.map(decode_image)
+
+    # Set format for PyTorch
+    hf_dataset.set_format(type="torch")
+
+    # Only proceed if we have data
+    if len(hf_dataset) == 0:
+        print("ERROR: No samples passed the filter!")
+        return
+
+    # Create a custom IterableDataset for hf_dataset
+    from torch.utils.data import IterableDataset, get_worker_info
+    class HFDIterableDataset(IterableDataset):
+        def __init__(self, hf_dataset):
+            self.hf_dataset = hf_dataset
+
+        def __iter__(self):
+            worker_info = get_worker_info()
+            num_samples = len(self.hf_dataset)
+            if worker_info is None:
+                # Single worker
+                start = 0
+                end = num_samples
+            else:
+                per_worker = int(math.ceil(num_samples / float(worker_info.num_workers)))
+                worker_id = worker_info.id
+                start = worker_id * per_worker
+                end = min(start + per_worker, num_samples)
+            for idx in range(start, end):
+                yield {
+                    'image': self.hf_dataset[idx]['image'],
+                    'problem': self.hf_dataset[idx]['problem'],
+                    'answer': self.hf_dataset[idx]['answer']
+                }
+
+    dataset = HFDIterableDataset(hf_dataset)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=False, num_workers=3)
+    final_response = []
+
+    # Remove the initial batch print/break loop
+
+    # Iterate over samples (not batches)
+    for batch in tqdm(dataloader, desc="MCTS Progress"):
+        images = batch['image']
+        problems = batch['problem']
+        answers = batch['answer']
+        for i in range(len(images)):
+            image_data = images[i]
+            question = problems[i]
+            answer = answers[i]
+
             try:
-                data['solution'] = ''.join(solution.solution_steps)
-                data['iters'] = n_iter
-                final_response.append(data)
+                start = time.time()
+                text_prompt = few_shot_cot_prompt + '{}'.format(question)
+
+                print(f"Processing sample...")
+                root, solution_steps, solution, n_iter = solve_math_reasoning_vlm(
+                    image_data=image_data,
+                    text_prompt=text_prompt,
+                    model=model,
+                    generation_config=generation_config,
+                    processor=processor,
+                    eval_llm=eval_llm,
+                    eval_llm_tokenizer=eval_llm_tokenizer,
+                    question=question,
+                    answer=answer,
+                    n_iterations=args.max_num_iterations,
+                )
+                print(f"Finished sample.")
+                print(f"Sample took {time.time() - start:.2f} seconds")
+
+                if solution is not None:
+                    try:
+                        result = {
+                            'image': image_data.tolist(),  # Convert tensor to list
+                            'problem': question,
+                            'answer': answer,
+                            'solution': ''.join(solution.solution_steps),
+                            'iters': n_iter
+                        }
+                        final_response.append(result)
+                    except Exception as e:
+                        continue
             except Exception as e:
+                print(f"Exception: {e}")
                 continue
 
     df = pd.DataFrame(final_response)
     df.to_parquet(args.output_file, index=False, engine='pyarrow')
 
+    # After collecting all results
+    torch.save(final_response, "answer.pt")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct")
-    parser.add_argument("--eval_model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-VL-1.5B-Instruct")
+    parser.add_argument("--eval_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--data_pths", type=str, nargs='+', default="None")
     parser.add_argument("--output_file", type=str, default="answer.jsonl")
     parser.add_argument("--max_num_iterations", type=int, default=50)
