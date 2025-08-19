@@ -21,6 +21,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import argparse
 from tqdm import tqdm
 import time
+import psutil
+import gc
 
 
 
@@ -75,9 +77,44 @@ def get_chunk(lst, n, k):
     chunks = split_list(lst, n)
     return chunks[k]
 
+def calculate_chunk_info(total_samples, num_chunks, chunk_idx):
+    """Calculate chunk information for logging"""
+    chunk_size = math.ceil(total_samples / num_chunks)
+    start_idx = chunk_idx * chunk_size
+    end_idx = min(start_idx + chunk_size, total_samples)
+    return {
+        'chunk_size': chunk_size,
+        'start_idx': start_idx,
+        'end_idx': end_idx,
+        'actual_samples': end_idx - start_idx
+    }
+
 def dump_to_jsonl(obj: list[dict], path: str):
     with open(path, 'w') as file:
         file.writelines([json.dumps(x) + '\n' for x in obj])
+
+def get_memory_usage():
+    """Get current memory usage in MB"""
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    return {
+        'rss_mb': memory_info.rss / 1024 / 1024,  # Resident Set Size
+        'vms_mb': memory_info.vms / 1024 / 1024,  # Virtual Memory Size
+        'percent': process.memory_percent()
+    }
+
+def log_memory_usage(stage=""):
+    """Log current memory usage"""
+    mem = get_memory_usage()
+    print(f"[MEMORY {stage}] RSS: {mem['rss_mb']:.1f}MB, VMS: {mem['vms_mb']:.1f}MB, Percent: {mem['percent']:.1f}%")
+    
+    # Force garbage collection if memory usage is high
+    if mem['rss_mb'] > 10000:  # 10GB threshold
+        print(f"[MEMORY] High memory usage detected, running garbage collection...")
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        mem_after = get_memory_usage()
+        print(f"[MEMORY] After GC - RSS: {mem_after['rss_mb']:.1f}MB, VMS: {mem_after['vms_mb']:.1f}MB")
 
 class State:
 
@@ -154,7 +191,7 @@ class VisionLanguageModel:
         question_input_length = inputs['input_ids'].shape[1]
 
         generated_ids = self.model.generate(**inputs, generation_config=generation_config, stop_strings=['<end>'],
-                                       max_new_tokens=2048, tokenizer=self.processor.tokenizer)
+                                       max_new_tokens=512, tokenizer=self.processor.tokenizer)
         output = self.processor.decode(
             generated_ids[0][question_input_length:], skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
@@ -180,7 +217,7 @@ class VisionLanguageModel:
         next_state = state.copy()
         next_state.solution_steps.append(action.text)
 
-        if len(next_state.solution_steps) >= 10 or "Final Answer: " in next_state.solution_steps[-1]:
+        if len(next_state.solution_steps) >= 5 or "Final Answer: " in next_state.solution_steps[-1] or "$\\boxed{" in next_state.solution_steps[-1]:
             next_state.is_terminal = True
         return next_state
 
@@ -266,7 +303,7 @@ def expand(node, vlm, generation_config, top_k=3):
             node.children[action] = child_node
 
 
-def simulate(state, vlm, eval_llm, eval_llm_tokenizer, question, answer, generation_config, rollout_limit=10):
+def simulate(state, vlm, eval_llm, eval_llm_tokenizer, question, answer, generation_config, rollout_limit=3):
     temp_state = state.copy()
     steps = 0
     while not temp_state.is_terminal and steps < rollout_limit:
@@ -286,11 +323,17 @@ def backpropagate(node, reward):
         cur = cur.parent
 
 def mcts_search(root_state, vlm, eval_llm, eval_llm_tokenizer, question, answer, generation_config, n_iterations,
-                c_puct=1.0, top_k=3):
+                c_puct=1.0, top_k=3, early_stop=5, time_budget=None):
+    import time
+    start_time = time.time()
     root_node = MCTSNode(root_state)
     solution = None
 
     for iter in range(n_iterations):
+        # Check time budget
+        if time_budget and (time.time() - start_time) > time_budget:
+            print(f"[MCTS] Time budget exceeded at iteration {iter}, stopping early")
+            break
         node = root_node
         while not node.state.is_terminal and len(node.children) > 0:
             _, child = select_child(node, c_puct)
@@ -304,12 +347,22 @@ def mcts_search(root_state, vlm, eval_llm, eval_llm_tokenizer, question, answer,
 
 
         reward, simulate_state = simulate(node.state, vlm, eval_llm, eval_llm_tokenizer, question, answer,
-                                          generation_config, rollout_limit=10)
+                                          generation_config, rollout_limit=3)
         if reward == 1:
             solution = simulate_state
             break
 
         backpropagate(node, reward)
+        
+        # More aggressive early stopping
+        if iter >= early_stop:
+            if root_node.visit_count > 0 and root_node.value > 0.1:
+                print(f"[MCTS] Early stopping at iteration {iter} with value {root_node.value:.3f}")
+                break
+            # Also stop if we're not making progress
+            if iter > early_stop * 2 and root_node.value < 0.05:
+                print(f"[MCTS] Stopping due to low progress at iteration {iter}")
+                break
 
     best_path = []
     current = root_node
@@ -320,7 +373,7 @@ def mcts_search(root_state, vlm, eval_llm, eval_llm_tokenizer, question, answer,
     return root_node, best_path, solution, iter
 
 def solve_math_reasoning_vlm(image_data, text_prompt, model, generation_config, processor, eval_llm,
-                                eval_llm_tokenizer, question, answer, n_iterations):
+                                eval_llm_tokenizer, question, answer, n_iterations, time_budget=480):
     image_feat = image_data
 
     init_state = State(
@@ -341,7 +394,8 @@ def solve_math_reasoning_vlm(image_data, text_prompt, model, generation_config, 
         generation_config=generation_config,
         n_iterations=n_iterations,
         c_puct=1.0,
-        top_k=3
+        top_k=3,
+        time_budget=time_budget
     )
     return root, steps, solution, n_iter
 
@@ -349,9 +403,12 @@ def solve_math_reasoning_vlm(image_data, text_prompt, model, generation_config, 
 def main(args):
     device = "cuda:{}".format(args.gpu_id)
     generation_config = GenerationConfig(
-        temperature=0.5,
+        temperature=0.7,
         do_sample=True,
         top_p=0.9,
+        top_k=50,
+        repetition_penalty=1.1,
+        pad_token_id=0,
     )
 
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -430,36 +487,78 @@ def main(args):
     # Create a custom IterableDataset for hf_dataset
     from torch.utils.data import IterableDataset, get_worker_info
     class HFDIterableDataset(IterableDataset):
-        def __init__(self, hf_dataset):
+        def __init__(self, hf_dataset, max_samples=None, chunk_idx=0, num_chunks=1, skip_samples=0):
             self.hf_dataset = hf_dataset
+            self.max_samples = max_samples
+            self.chunk_idx = chunk_idx
+            self.num_chunks = num_chunks
+            self.skip_samples = skip_samples
 
         def __iter__(self):
             worker_info = get_worker_info()
-            num_samples = len(self.hf_dataset)
+            total_samples = len(self.hf_dataset)
+            
+            # Calculate chunk boundaries
+            chunk_info = calculate_chunk_info(total_samples, self.num_chunks, self.chunk_idx)
+            start_idx = chunk_info['start_idx'] + self.skip_samples
+            end_idx = chunk_info['end_idx']
+            
+            print(f"[CHUNK] Processing chunk {self.chunk_idx + 1}/{self.num_chunks}")
+            print(f"[CHUNK] Samples {start_idx + 1}-{end_idx} of {total_samples} total")
+            print(f"[CHUNK] This chunk contains {chunk_info['actual_samples']} samples")
+            
+            # Limit samples for testing (if specified)
+            if self.max_samples:
+                actual_samples = min(chunk_info['actual_samples'], self.max_samples)
+                end_idx = start_idx + actual_samples
+                print(f"[CHUNK] Limited to {actual_samples} samples for testing")
+            
             if worker_info is None:
                 # Single worker
-                start = 0
-                end = num_samples
+                start = start_idx
+                end = end_idx
             else:
-                per_worker = int(math.ceil(num_samples / float(worker_info.num_workers)))
+                # Multiple workers within this chunk
+                chunk_size = end_idx - start_idx
+                per_worker = int(math.ceil(chunk_size / float(worker_info.num_workers)))
                 worker_id = worker_info.id
-                start = worker_id * per_worker
-                end = min(start + per_worker, num_samples)
+                start = start_idx + worker_id * per_worker
+                end = min(start + per_worker, end_idx)
+                
+            print(f"[CHUNK] Worker will process samples {start + 1}-{end}")
+            
             for idx in range(start, end):
                 yield {
                     'image': self.hf_dataset[idx]['image'],
                     'problem': self.hf_dataset[idx]['problem'],
-                    'answer': self.hf_dataset[idx]['answer']
+                    'answer': self.hf_dataset[idx]['answer'],
+                    'global_idx': idx  # Add global index for tracking
                 }
 
-    dataset = HFDIterableDataset(hf_dataset)
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=False, num_workers=3)
+    # Use chunking parameters
+    max_samples = args.max_samples  # Use command line argument
+    dataset = HFDIterableDataset(
+        hf_dataset, 
+        max_samples=max_samples,
+        chunk_idx=args.chunk_idx,
+        num_chunks=args.num_chunks,
+        skip_samples=args.skip_samples
+    )
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)  # Reduced batch size and workers
     final_response = []
 
-    # Remove the initial batch print/break loop
+    # Initialize progress tracking
+    total_samples = len(hf_dataset)
+    processed_samples = 0
+    successful_samples = 0
+    failed_samples = 0
+    start_time = time.time()
+    
+    print(f"[PROGRESS] Starting processing of {total_samples} samples")
+    log_memory_usage("START")
 
     # Iterate over samples (not batches)
-    for batch in tqdm(dataloader, desc="MCTS Progress"):
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc="MCTS Progress")):
         images = batch['image']
         problems = batch['problem']
         answers = batch['answer']
@@ -467,26 +566,49 @@ def main(args):
             image_data = images[i]
             question = problems[i]
             answer = answers[i]
+            global_idx = batch.get('global_idx', [processed_samples])[i] if isinstance(batch.get('global_idx'), list) else processed_samples
+            processed_samples += 1
+            sample_start_time = time.time()
 
             try:
-                start = time.time()
                 text_prompt = few_shot_cot_prompt + '{}'.format(question)
 
-                print(f"Processing sample...")
-                root, solution_steps, solution, n_iter = solve_math_reasoning_vlm(
-                    image_data=image_data,
-                    text_prompt=text_prompt,
-                    model=model,
-                    generation_config=generation_config,
-                    processor=processor,
-                    eval_llm=eval_llm,
-                    eval_llm_tokenizer=eval_llm_tokenizer,
-                    question=question,
-                    answer=answer,
-                    n_iterations=args.max_num_iterations,
-                )
-                print(f"Finished sample.")
-                print(f"Sample took {time.time() - start:.2f} seconds")
+                print(f"[PROGRESS] Processing sample {processed_samples}/{total_samples} (global idx: {global_idx}) (batch {batch_idx + 1})")
+                log_memory_usage(f"SAMPLE_{processed_samples}")
+                
+                # Add timeout for model inference
+                import signal
+                
+                def timeout_handler(signum, frame):
+                    raise TimeoutError("Model inference timed out")
+                
+                # Set timeout to 10 minutes per sample
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(600)  # 10 minutes timeout
+                
+                try:
+                    root, solution_steps, solution, n_iter = solve_math_reasoning_vlm(
+                        image_data=image_data,
+                        text_prompt=text_prompt,
+                        model=model,
+                        generation_config=generation_config,
+                        processor=processor,
+                        eval_llm=eval_llm,
+                        eval_llm_tokenizer=eval_llm_tokenizer,
+                        question=question,
+                        answer=answer,
+                        n_iterations=args.max_num_iterations,
+                        time_budget=480  # 8 minutes internal budget (2 min buffer for 10 min timeout)
+                    )
+                    signal.alarm(0)  # Cancel timeout
+                except TimeoutError:
+                    signal.alarm(0)  # Cancel timeout
+                    print(f"[PROGRESS] Sample {processed_samples} TIMEOUT after 10 minutes")
+                    failed_samples += 1
+                    continue
+                
+                sample_time = time.time() - sample_start_time
+                print(f"[PROGRESS] Sample {processed_samples} completed in {sample_time:.2f}s")
 
                 if solution is not None:
                     try:
@@ -498,17 +620,58 @@ def main(args):
                             'iters': n_iter
                         }
                         final_response.append(result)
+                        successful_samples += 1
+                        print(f"[PROGRESS] Sample {processed_samples} SUCCESS - Total successful: {successful_samples}")
                     except Exception as e:
+                        failed_samples += 1
+                        print(f"[PROGRESS] Sample {processed_samples} FAILED (result processing): {e}")
                         continue
+                else:
+                    failed_samples += 1
+                    print(f"[PROGRESS] Sample {processed_samples} FAILED (no solution)")
+                    
             except Exception as e:
-                print(f"Exception: {e}")
+                failed_samples += 1
+                print(f"[PROGRESS] Sample {processed_samples} FAILED (processing): {e}")
                 continue
+                
+            # Log progress every 10 samples
+            if processed_samples % 10 == 0:
+                elapsed_time = time.time() - start_time
+                avg_time_per_sample = elapsed_time / processed_samples
+                estimated_remaining = avg_time_per_sample * (total_samples - processed_samples)
+                
+                print(f"[PROGRESS] === PROGRESS UPDATE ===")
+                print(f"[PROGRESS] Processed: {processed_samples}/{total_samples} ({processed_samples/total_samples*100:.1f}%)")
+                print(f"[PROGRESS] Successful: {successful_samples}, Failed: {failed_samples}")
+                print(f"[PROGRESS] Success rate: {successful_samples/processed_samples*100:.1f}%")
+                print(f"[PROGRESS] Elapsed time: {elapsed_time/60:.1f} minutes")
+                print(f"[PROGRESS] Estimated remaining: {estimated_remaining/60:.1f} minutes")
+                log_memory_usage(f"PROGRESS_{processed_samples}")
+                print(f"[PROGRESS] ========================")
 
+    # Final progress summary
+    total_time = time.time() - start_time
+    print(f"[PROGRESS] === FINAL SUMMARY ===")
+    print(f"[PROGRESS] Total samples: {total_samples}")
+    print(f"[PROGRESS] Processed: {processed_samples}")
+    print(f"[PROGRESS] Successful: {successful_samples}")
+    print(f"[PROGRESS] Failed: {failed_samples}")
+    print(f"[PROGRESS] Success rate: {successful_samples/processed_samples*100:.1f}%")
+    print(f"[PROGRESS] Total time: {total_time/60:.1f} minutes")
+    print(f"[PROGRESS] Average time per sample: {total_time/processed_samples:.2f} seconds")
+    log_memory_usage("FINAL")
+    print(f"[PROGRESS] ======================")
+
+    # Save results
+    print(f"[SAVE] Saving {len(final_response)} results to {args.output_file}")
     df = pd.DataFrame(final_response)
     df.to_parquet(args.output_file, index=False, engine='pyarrow')
+    print(f"[SAVE] Parquet file saved successfully")
 
     # After collecting all results
     torch.save(final_response, "answer.pt")
+    print(f"[SAVE] PyTorch file saved successfully")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -520,6 +683,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-chunks", type=int, default=1)
     parser.add_argument("--chunk-idx", type=int, default=0)
     parser.add_argument("--gpu-id", type=int, default=0)
+    parser.add_argument("--max-samples", type=int, default=10, help="Maximum number of samples to process (for testing)")
+    parser.add_argument("--skip-samples", type=int, default=0, help="Number of samples to skip from the beginning")
     args = parser.parse_args()
 
     main(args)
