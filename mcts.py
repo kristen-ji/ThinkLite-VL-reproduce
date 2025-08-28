@@ -402,6 +402,12 @@ def solve_math_reasoning_vlm(image_data, text_prompt, model, generation_config, 
 
 def main(args):
     device = "cuda:{}".format(args.gpu_id)
+    
+    # Explicitly set the CUDA device for this process
+    import torch
+    torch.cuda.set_device(args.gpu_id)
+    print(f"[GPU SETUP] Using GPU {args.gpu_id} for chunk {args.chunk_idx}")
+    
     generation_config = GenerationConfig(
         temperature=0.7,
         do_sample=True,
@@ -501,11 +507,17 @@ def main(args):
             # Calculate chunk boundaries
             chunk_info = calculate_chunk_info(total_samples, self.num_chunks, self.chunk_idx)
             start_idx = chunk_info['start_idx'] + self.skip_samples
-            end_idx = chunk_info['end_idx']
+            end_idx = chunk_info['end_idx'] + self.skip_samples
+            
+            # Ensure we don't go beyond the dataset size
+            if start_idx >= total_samples:
+                print(f"[CHUNK] Skipping chunk {self.chunk_idx + 1} - start_idx {start_idx} >= total_samples {total_samples}")
+                return
+            end_idx = min(end_idx, total_samples)
             
             print(f"[CHUNK] Processing chunk {self.chunk_idx + 1}/{self.num_chunks}")
             print(f"[CHUNK] Samples {start_idx + 1}-{end_idx} of {total_samples} total")
-            print(f"[CHUNK] This chunk contains {chunk_info['actual_samples']} samples")
+            print(f"[CHUNK] This chunk contains {end_idx - start_idx} samples")
             
             # Limit samples for testing (if specified)
             if self.max_samples:
@@ -544,7 +556,14 @@ def main(args):
         num_chunks=args.num_chunks,
         skip_samples=args.skip_samples
     )
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)  # Reduced batch size and workers
+    # Optimize DataLoader for parallel chunk processing
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=1,  # Keep batch_size=1 for memory efficiency per chunk
+        shuffle=False, 
+        num_workers=0,  # Keep 0 to avoid multiprocessing issues in SLURM
+        pin_memory=True  # Enable pin memory for faster GPU transfer
+    )
     final_response = []
 
     # Initialize progress tracking
@@ -554,7 +573,8 @@ def main(args):
     failed_samples = 0
     start_time = time.time()
     
-    print(f"[PROGRESS] Starting processing of {total_samples} samples")
+    print(f"[CHUNK {args.chunk_idx}] Starting processing of {total_samples} samples on GPU {args.gpu_id}")
+    print(f"[CHUNK {args.chunk_idx}] Chunk {args.chunk_idx}/{args.num_chunks} - Samples {args.skip_samples} to {args.skip_samples + total_samples}")
     log_memory_usage("START")
 
     # Iterate over samples (not batches)
@@ -683,7 +703,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-chunks", type=int, default=1)
     parser.add_argument("--chunk-idx", type=int, default=0)
     parser.add_argument("--gpu-id", type=int, default=0)
-    parser.add_argument("--max-samples", type=int, default=10, help="Maximum number of samples to process (for testing)")
+    parser.add_argument("--max-samples", type=int, default=None, help="Maximum number of samples to process (for testing, None = no limit)")
     parser.add_argument("--skip-samples", type=int, default=0, help="Number of samples to skip from the beginning")
     args = parser.parse_args()
 
