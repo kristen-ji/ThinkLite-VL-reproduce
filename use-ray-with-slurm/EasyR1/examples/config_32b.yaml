@@ -1,0 +1,126 @@
+# ===== Qwen2.5-VL-32B GRPO Configuration =====
+# Optimized configuration for 32B model training
+
+data:
+  train_files: hiyouga/geometry3k@train
+  val_files: hiyouga/geometry3k@test
+  prompt_key: problem  # Specify the field name for prompts
+  answer_key: answer    # Specify the field name for answers
+  image_key: images     # Specify the field name for images
+  video_key: videos     # Specify the field name for videos
+  image_dir: null
+  video_fps: 2.0
+  max_prompt_length: 384  # More permissive for debugging data loading
+  max_response_length: 192  # More permissive for debugging data loading
+  rollout_batch_size: 2  # Reduced for 32B memory constraints
+  mini_rollout_batch_size: 2  # Reduced for 32B memory constraints
+  val_batch_size: 2  # Reduced for 32B memory constraints
+  format_prompt: ./examples/format_prompt/math.jinja
+  override_chat_template: null
+  shuffle: true
+  seed: 1
+  min_pixels: 1024  # Very permissive minimum for 32B model (32x32)
+  max_pixels: 1048576  # More permissive maximum for debugging data loading (1024x1024)
+  filter_overlong_prompts: false  # Temporarily disable filtering to debug data loading
+
+algorithm:
+  adv_estimator: grpo  # Use GRPO for 32B model
+  disable_kl: false
+  use_kl_loss: true
+  kl_penalty: low_var_kl
+  kl_coef: 1.0e-2
+  kl_target: 0.02          # ~0.02 nats/token target
+  kl_type: adaptive
+  online_filtering: false  # dapo filter groups
+  filter_key: overall
+  filter_low: 0.01
+  filter_high: 0.99
+
+worker:
+  actor:
+    global_batch_size: 2  # Reduced for 32B memory constraints
+    micro_batch_size_per_device_for_update: 1  # Minimal batch size for memory safety
+    micro_batch_size_per_device_for_experience: 1  # Minimal batch size for memory safety
+    max_grad_norm: 1.0
+    padding_free: true
+    dynamic_batching: true
+    ulysses_size: 1
+    model:
+      model_path: "Qwen/Qwen2.5-VL-32B-Instruct"
+      enable_gradient_checkpointing: true
+      trust_remote_code: false
+      freeze_vision_tower: true  # Freeze vision tower to save memory for 32B
+      override_config:
+        use_cache: false  # Disable KV cache during training to save memory
+        attn_implementation: "flash_attention_2"  # Use flash attention for memory efficiency
+        max_memory: 0.8  # Limit GPU memory usage to 80%
+        torch_dtype: "bfloat16"  # Force bfloat16 for memory efficiency
+    optim:
+      lr: 5.0e-7  # Reduced learning rate for 32B
+      weight_decay: 1.0e-2
+      strategy: adamw_bf16
+      lr_warmup_ratio: 0.1  # Increased warmup for 32B
+    fsdp:
+      enable_full_shard: true
+      enable_cpu_offload: true  # Enable FSDP CPU offloading for 32B memory
+      enable_rank0_init: true
+      torch_dtype: bf16
+      mp_param_dtype: bf16
+      mp_reduce_dtype: bf16
+      mp_buffer_dtype: bf16
+      use_orig_params: true  # Required for vision tower freezing
+    offload:
+      offload_params: false  # Disable generic offloading - use FSDP offloading instead
+      offload_optimizer: false  # Disable generic offloading - use FSDP offloading instead
+
+  rollout:
+    n: 2  # Required for GRPO algorithm
+    temperature: 0.7
+    top_p: 1.0
+    limit_images: 0
+    gpu_memory_utilization: 0.0005  # More reasonable for 32B model
+    enforce_eager: true  # Disable CUDA graphs to save memory
+    enable_chunked_prefill: true  # Enable for 32B efficiency
+    tensor_parallel_size: 2  # Keep reduced tensor parallelism for memory efficiency
+    disable_tqdm: false
+    max_num_batched_tokens: 768  # Must be > prompt_length + response_length (384 + 192 = 576)
+    val_override_config:
+      temperature: 0.6
+      top_p: 0.95
+      n: 1
+
+  ref:
+    fsdp:
+      enable_full_shard: true
+      enable_cpu_offload: true  # Enable FSDP CPU offloading for 32B memory
+      enable_rank0_init: true
+      torch_dtype: bf16
+      mp_param_dtype: bf16
+      mp_reduce_dtype: bf16
+      mp_buffer_dtype: bf16
+      use_orig_params: true  # Required for vision tower freezing
+    offload:
+      offload_params: false  # Use FSDP offloading instead
+
+  reward:
+    reward_type: batch  # Use batch reward
+    reward_function: ./examples/reward_function/math.py:compute_score
+    num_cpus: 8  # Increased for 32B model
+
+trainer:
+  total_epochs: 10  # Reduced epochs for 32B
+  max_steps: null
+  project_name: easy_r1
+  experiment_name: qwen2_5_grpo_32b
+  logger: ["console", "wandb"]
+  nnodes: 2  # Two-node setup for 32B (reduced from 4)
+  n_gpus_per_node: 4  # 4 GPUs per node (reduced from 8)
+  max_try_make_batch: 2  # Further reduced for 32B memory constraints
+  val_freq: 20  # Less frequent validation to save memory
+  val_before_train: true
+  val_only: false
+  val_generations_to_log: 1  # Reduced for 32B
+  save_freq: 20  # Less frequent saves to save memory
+  save_limit: 1  # Reduced save limit to save memory
+  save_model_only: true  # Save only model for 32B
+  save_checkpoint_path: /hkfs/work/workspace/scratch/st_st190232-myspace/checkpoints_32b

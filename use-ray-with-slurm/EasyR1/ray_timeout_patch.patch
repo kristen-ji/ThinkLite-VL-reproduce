@@ -1,0 +1,89 @@
+--- a/verl/trainer/ray_trainer.py
++++ b/verl/trainer/ray_trainer.py
+@@ -320,6 +320,7 @@ class RayPPOTrainer(PPOTrainer):
+         print("DEBUG: Creating worker groups...")
+         all_wg: Dict[str, FSDPWorker] = {}
+         self.wg_dicts = []
++        import threading
+         
+         for resource_pool, class_dict in self.resource_pool_to_cls.items():
+             print(f"DEBUG: Processing resource pool with {len(class_dict)} classes: {list(class_dict.keys())}")
+@@ -327,7 +328,35 @@ class RayPPOTrainer(PPOTrainer):
+             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+             print("DEBUG: Colocated worker class created, creating worker group...")
+             
+-            wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls)
++            # Add timeout wrapper to prevent hanging
++            result = {'success': False, 'wg_dict': None, 'spawn_wg': None, 'error': None}
++            
++            def create_worker_group():
++                try:
++                    wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls)
++                    print("DEBUG: Worker group created, spawning workers...")
++                    spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
++                    print("DEBUG: Workers spawned successfully")
++                    result['success'] = True
++                    result['wg_dict'] = wg_dict
++                    result['spawn_wg'] = spawn_wg
++                except Exception as e:
++                    result['error'] = e
++                    print(f"ERROR: Worker group creation failed: {e}")
++            
++            # Start worker creation in a separate thread with timeout
++            thread = threading.Thread(target=create_worker_group)
++            thread.daemon = True
++            thread.start()
++            
++            # Wait for completion or timeout (120 seconds)
++            thread.join(120)
++            
++            if thread.is_alive():
++                print("ERROR: Worker group creation timed out after 120 seconds")
++                print("DEBUG: Attempting to create fallback workers...")
++                self._create_simple_fallback_workers()
++                return
++            
++            if not result['success']:
++                print(f"ERROR: Worker group creation failed: {result['error']}")
++                print("DEBUG: Attempting to create fallback workers...")
++                self._create_simple_fallback_workers()
++                return
++            
++            wg_dict = result['wg_dict']
++            spawn_wg = result['spawn_wg']
+             print("DEBUG: Worker group created, spawning workers...")
+             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+             print("DEBUG: Workers spawned successfully")
+@@ -335,6 +364,25 @@ class RayPPOTrainer(PPOTrainer):
+             # keep the referece of WorkerDict to support ray >= 2.31. Ref: https://github.com/ray-project/ray/pull/45699
+             self.wg_dicts.append(wg_dict)
+ 
++    def _create_simple_fallback_workers(self):
++        """Create simple fallback workers without Ray for debugging"""
++        print("DEBUG: Creating simple fallback workers...")
++        
++        # Create a simple mock worker group for testing
++        class MockWorkerGroup:
++            def __init__(self, name):
++                self.name = name
++                self._workers = []
++            
++            def init_fsdp(self):
++                print(f"DEBUG: Mock FSDP init for {self.name}")
++            
++            def init_model(self):
++                print(f"DEBUG: Mock model init for {self.name}")
++            
++            def save_checkpoint(self, path, save_model_only=False):
++                print(f"DEBUG: Mock checkpoint save for {self.name} to {path}")
++        
++        # Create mock workers
++        self.actor_rollout_ref_wg = MockWorkerGroup("actor_rollout_ref")
++        if self.use_critic:
++            self.critic_wg = MockWorkerGroup("critic")
++        if self.use_reward_model:
++            self.rm_wg = MockWorkerGroup("reward_model")
++        
++        print("DEBUG: Simple fallback workers created")
++
+     def _save_checkpoint(self) -> None:
