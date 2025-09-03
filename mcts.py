@@ -430,13 +430,17 @@ def main(args):
     eval_llm_tokenizer = AutoTokenizer.from_pretrained(args.eval_model_name)
     final_response = []
 
-    #df = pd.read_parquet(args.data_pths, engine='pyarrow')  # Your path of dataset
-    #df = load_dataset("russwang/ThinkLite-VL-70k")
-    #datas = df.to_dict(orient='records')
-    #datas = df["train"].to_pandas().to_dict(orient='records')
-
-    # Load the dataset
-    hf_dataset = load_dataset("russwang/ThinkLite-VL-70k")["train"]
+    # Load the dataset - use Hugging Face if no local file provided
+    if args.data_pths and args.data_pths != "None":
+        print(f"Loading dataset from local file: {args.data_pths}")
+        df = pd.read_parquet(args.data_pths, engine='pyarrow')
+        hf_dataset = df.to_dict(orient='records')
+        # Convert to HuggingFace dataset format
+        from datasets import Dataset
+        hf_dataset = Dataset.from_list(hf_dataset)
+    else:
+        print("Loading dataset from Hugging Face: russwang/ThinkLite-VL-70k")
+        hf_dataset = load_dataset("russwang/ThinkLite-VL-70k")["train"]
     print(f"Original dataset size: {len(hf_dataset)}")
 
     # Print a few samples to see the structure
